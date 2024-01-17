@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,10 +37,18 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/kubestore"
+	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/tsnet"
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
 )
+
+// Generate static manifests for deploying Tailscale operator on Kubernetes from the operator's Helm chart.
+//go:generate go run tailscale.com/cmd/k8s-operator/generate staticmanifests
+
+// Generate Connector CustomResourceDefinition yaml from its Go types.
+//go:generate go run sigs.k8s.io/controller-tools/cmd/controller-gen crd schemapatch:manifests=./deploy/crds output:dir=./deploy/crds paths=../../k8s-operator/apis/...
 
 func main() {
 	// Required to use our client API. We're fine with the instability since the
@@ -67,10 +76,22 @@ func main() {
 	zlog := kzap.NewRaw(opts...).Sugar()
 	logf.SetLogger(zapr.NewLogger(zlog.Desugar()))
 
+	// The operator can run either as a plain operator or it can
+	// additionally act as api-server proxy
+	// https://tailscale.com/kb/1236/kubernetes-operator/?q=kubernetes#accessing-the-kubernetes-control-plane-using-an-api-server-proxy.
+	mode := parseAPIProxyMode()
+	if mode == apiserverProxyModeDisabled {
+		hostinfo.SetApp("k8s-operator")
+	} else {
+		hostinfo.SetApp("k8s-operator-proxy")
+	}
+
 	s, tsClient := initTSNet(zlog)
 	defer s.Close()
 	restConfig := config.GetConfigOrDie()
-	maybeLaunchAPIServerProxy(zlog, restConfig, s)
+	maybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
+	// TODO (irbekrm): gather the reconciler options into an opts struct
+	// rather than passing a million of them in one by one.
 	runReconcilers(zlog, s, tsNamespace, restConfig, tsClient, image, priorityClassName, tags, tsFirewallMode)
 }
 
@@ -78,7 +99,6 @@ func main() {
 // CLIENT_ID_FILE and CLIENT_SECRET_FILE environment variables to authenticate
 // with Tailscale.
 func initTSNet(zlog *zap.SugaredLogger) (*tsnet.Server, *tailscale.Client) {
-	hostinfo.SetApp("k8s-operator")
 	var (
 		clientIDPath     = defaultEnv("CLIENT_ID_FILE", "")
 		clientSecretPath = defaultEnv("CLIENT_SECRET_FILE", "")
@@ -194,20 +214,26 @@ func runReconcilers(zlog *zap.SugaredLogger, s *tsnet.Server, tsNamespace string
 	nsFilter := cache.ByObject{
 		Field: client.InNamespace(tsNamespace).AsSelector(),
 	}
-	mgr, err := manager.New(restConfig, manager.Options{
+	mgrOpts := manager.Options{
+		// TODO (irbekrm): stricter filtering what we watch/cache/call
+		// reconcilers on. c/r by default starts a watch on any
+		// resources that we GET via the controller manager's client.
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Secret{}:      nsFilter,
 				&appsv1.StatefulSet{}: nsFilter,
 			},
 		},
-	})
+		Scheme: tsapi.GlobalScheme,
+	}
+	mgr, err := manager.New(restConfig, mgrOpts)
 	if err != nil {
 		startlog.Fatalf("could not create manager: %v", err)
 	}
 
 	svcFilter := handler.EnqueueRequestsFromMapFunc(serviceHandler)
 	svcChildFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("svc"))
+
 	eventRecorder := mgr.GetEventRecorderFor("tailscale-operator")
 	ssr := &tailscaleSTSReconciler{
 		Client:                 mgr.GetClient(),
@@ -252,6 +278,21 @@ func runReconcilers(zlog *zap.SugaredLogger, s *tsnet.Server, tsNamespace string
 		startlog.Fatalf("could not create controller: %v", err)
 	}
 
+	connectorFilter := handler.EnqueueRequestsFromMapFunc(managedResourceHandlerForType("connector"))
+	err = builder.ControllerManagedBy(mgr).
+		For(&tsapi.Connector{}).
+		Watches(&appsv1.StatefulSet{}, connectorFilter).
+		Watches(&corev1.Secret{}, connectorFilter).
+		Complete(&ConnectorReconciler{
+			ssr:      ssr,
+			recorder: eventRecorder,
+			Client:   mgr.GetClient(),
+			logger:   zlog.Named("connector-reconciler"),
+			clock:    tstime.DefaultClock{},
+		})
+	if err != nil {
+		startlog.Fatal("could not create connector reconciler: %v", err)
+	}
 	startlog.Infof("Startup complete, operator running, version: %s", version.Long())
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		startlog.Fatalf("could not start manager: %v", err)
@@ -312,4 +353,11 @@ func serviceHandler(_ context.Context, o client.Object) []reconcile.Request {
 		},
 	}
 
+}
+
+// isMagicDNSName reports whether name is a full tailnet node FQDN (with or
+// without final dot).
+func isMagicDNSName(name string) bool {
+	validMagicDNSName := regexp.MustCompile(`^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.ts\.net\.?$`)
+	return validMagicDNSName.MatchString(name)
 }

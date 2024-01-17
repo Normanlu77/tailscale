@@ -189,8 +189,6 @@ type Resolver struct {
 
 	// closed signals all goroutines to stop.
 	closed chan struct{}
-	// wg signals when all goroutines have stopped.
-	wg sync.WaitGroup
 
 	// mu guards the following fields from being updated while used.
 	mu           sync.Mutex
@@ -314,9 +312,9 @@ func parseExitNodeQuery(q []byte) *response {
 	return p.response()
 }
 
-// HandleExitNodeDNSQuery handles a DNS query that arrived from a peer
-// via the peerapi's DoH server. This is only used when the local
-// node is being an exit node.
+// HandlePeerDNSQuery handles a DNS query that arrived from a peer
+// via the peerapi's DoH server. This is used when the local
+// node is being an exit node or an app connector.
 //
 // The provided allowName callback is whether a DNS query for a name
 // (as found by parsing q) is allowed.
@@ -325,7 +323,7 @@ func parseExitNodeQuery(q []byte) *response {
 // still result in a response DNS packet (saying there's a failure)
 // and a nil error.
 // TODO: figure out if we even need an error result.
-func (r *Resolver) HandleExitNodeDNSQuery(ctx context.Context, q []byte, from netip.AddrPort, allowName func(name string) bool) (res []byte, err error) {
+func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.AddrPort, allowName func(name string) bool) (res []byte, err error) {
 	metricDNSExitProxyQuery.Add(1)
 	ch := make(chan packet, 1)
 
@@ -609,6 +607,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 			}
 		}
 		// Not authoritative, signal that forwarding is advisable.
+		metricDNSResolveLocalErrorRefused.Add(1)
 		return netip.Addr{}, dns.RCodeRefused
 	}
 
@@ -1248,6 +1247,7 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 	resp := parser.response()
 	resp.Header.RCode = rcode
 	resp.IP = ip
+	metricDNSMagicDNSSuccessName.Add(1)
 	return marshalResponse(resp)
 }
 
@@ -1305,9 +1305,8 @@ var (
 	metricDNSFwdErrorContext         = clientmetric.NewCounter("dns_query_fwd_error_context")
 	metricDNSFwdErrorContextGotError = clientmetric.NewCounter("dns_query_fwd_error_context_got_error")
 
-	metricDNSFwdErrorType      = clientmetric.NewCounter("dns_query_fwd_error_type")
-	metricDNSFwdErrorParseAddr = clientmetric.NewCounter("dns_query_fwd_error_parse_addr")
-	metricDNSFwdTruncated      = clientmetric.NewCounter("dns_query_fwd_truncated")
+	metricDNSFwdErrorType = clientmetric.NewCounter("dns_query_fwd_error_type")
+	metricDNSFwdTruncated = clientmetric.NewCounter("dns_query_fwd_truncated")
 
 	metricDNSFwdUDP            = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
 	metricDNSFwdUDPWrote       = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet

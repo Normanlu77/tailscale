@@ -139,6 +139,8 @@ type Conn struct {
 	// logging.
 	noV4, noV6 atomic.Bool
 
+	silentDiscoOn atomic.Bool // whether silent disco is enabled
+
 	// noV4Send is whether IPv4 UDP is known to be unable to transmit
 	// at all. This could happen if the socket is in an invalid state
 	// (as can happen on darwin after a network link status change).
@@ -167,6 +169,8 @@ type Conn struct {
 	port atomic.Uint32
 
 	// peerMTUEnabled is whether path MTU discovery to peers is enabled.
+	//
+	//lint:ignore U1000 used on Linux/Darwin only
 	peerMTUEnabled atomic.Bool
 
 	// stats maintains per-connection counters.
@@ -268,6 +272,7 @@ type Conn struct {
 	privateKey       key.NodePrivate               // WireGuard private key for this node
 	everHadKey       bool                          // whether we ever had a non-zero private key
 	myDerp           int                           // nearest DERP region ID; 0 means none/unknown
+	homeless         bool                          // if true, don't try to find & stay conneted to a DERP home (myDerp will stay 0)
 	derpStarted      chan struct{}                 // closed on first connection to DERP; for tests & cleaner Close
 	activeDerp       map[int]activeDerp            // DERP regionID -> connection to a node in that region
 	prevDerp         map[int]*syncs.WaitGroupChan
@@ -287,6 +292,10 @@ type Conn struct {
 
 	// wgPinger is the WireGuard only pinger used for latency measurements.
 	wgPinger lazy.SyncValue[*ping.Pinger]
+
+	// onPortUpdate is called with the new port when magicsock rebinds to
+	// a new port.
+	onPortUpdate func(port uint16, network string)
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -352,6 +361,10 @@ type Options struct {
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
 	ControlKnobs *controlknobs.Knobs
+
+	// OnPortUpdate is called with the new port when magicsock rebinds to
+	// a new port.
+	OnPortUpdate func(port uint16, network string)
 }
 
 func (o *Options) logf() logger.Logf {
@@ -424,6 +437,7 @@ func NewConn(opts Options) (*Conn, error) {
 		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	}
 	c.netMon = opts.NetMon
+	c.onPortUpdate = opts.OnPortUpdate
 
 	if err := c.rebind(keepCurrentPort); err != nil {
 		return nil, err
@@ -616,7 +630,17 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	report, err := c.netChecker.GetReport(ctx, dm)
+	report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
+		// Pass information about the last time that we received a
+		// frame from a DERP server to our netchecker to help avoid
+		// flapping the home region while there's still active
+		// communication.
+		//
+		// NOTE(andrew-d): I don't love that we're depending on the
+		// health package here, but I'd rather do that and not store
+		// the exact same state in two different places.
+		GetLastDERPActivity: health.GetDERPRegionReceivedTime,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1511,7 +1535,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 	// mappings to make p2p path discovery faster in simple
 	// cases. Without this, disco would still work, but would be
 	// reliant on DERP call-me-maybe to establish the disco<>node
-	// mapping, and on subsequent disco handlePongLocked to establish
+	// mapping, and on subsequent disco handlePongConnLocked to establish
 	// the IP<>disco mapping.
 	if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
 		if !isDerp {
@@ -1797,8 +1821,29 @@ type debugFlags struct {
 }
 
 func (c *Conn) debugFlagsLocked() (f debugFlags) {
-	f.heartbeatDisabled = debugEnableSilentDisco() // TODO(bradfitz): controlknobs too, later
+	f.heartbeatDisabled = debugEnableSilentDisco() || c.silentDiscoOn.Load()
 	return
+}
+
+// SetSilentDisco toggles silent disco based on v.
+func (c *Conn) SetSilentDisco(v bool) {
+	old := c.silentDiscoOn.Swap(v)
+	if old == v {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.setHeartbeatDisabled(v)
+	})
+}
+
+// SilentDisco returns true if silent disco is enabled, otherwise false.
+func (c *Conn) SilentDisco() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	flags := c.debugFlagsLocked()
+	return flags.heartbeatDisabled
 }
 
 // SetNetworkMap is called when the control client gets a new network
@@ -2179,7 +2224,7 @@ func (c *Conn) goroutinesRunningLocked() bool {
 }
 
 func (c *Conn) shouldDoPeriodicReSTUNLocked() bool {
-	if c.networkDown() {
+	if c.networkDown() || c.homeless {
 		return false
 	}
 	if len(c.peerSet) == 0 || c.privateKey.IsZero() {
@@ -2317,6 +2362,19 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 		if err != nil {
 			c.logf("magicsock: unable to bind %v port %d: %v", network, port, err)
 			continue
+		}
+		if c.onPortUpdate != nil {
+			_, gotPortStr, err := net.SplitHostPort(pconn.LocalAddr().String())
+			if err != nil {
+				c.logf("could not parse port from %s: %w", pconn.LocalAddr().String(), err)
+			} else {
+				gotPort, err := strconv.ParseUint(gotPortStr, 10, 16)
+				if err != nil {
+					c.logf("could not parse port from %s: %w", gotPort, err)
+				} else {
+					c.onPortUpdate(uint16(gotPort), network)
+				}
+			}
 		}
 		trySetSocketBuffer(pconn, c.logf)
 
@@ -2663,6 +2721,24 @@ func (c *Conn) SetStatistics(stats *connstats.Statistics) {
 	c.stats.Store(stats)
 }
 
+// SetHomeless sets whether magicsock should idle harder and not have a DERP
+// home connection active and not search for its nearest DERP home. In this
+// homeless mode, the node is unreachable by others.
+func (c *Conn) SetHomeless(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.homeless = v
+
+	if v && c.myDerp != 0 {
+		oldHome := c.myDerp
+		c.myDerp = 0
+		c.closeDerpLocked(oldHome, "set-homeless")
+	}
+	if !v {
+		go c.updateEndpoints("set-homeless-disabled")
+	}
+}
+
 const (
 	// sessionActiveTimeout is how long since the last activity we
 	// try to keep an established endpoint peering alive.
@@ -2859,7 +2935,9 @@ var (
 	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
 
 	// Disco packets received bpf read path
+	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv4 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv4")
+	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv6 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv6")
 
 	// metricMaxPeerMTUProbed is the largest peer path MTU we successfully probed.

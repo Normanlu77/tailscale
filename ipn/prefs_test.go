@@ -20,6 +20,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 )
@@ -58,7 +59,9 @@ func TestPrefsEqual(t *testing.T) {
 		"OperatorUser",
 		"ProfileName",
 		"AutoUpdate",
+		"AppConnector",
 		"PostureChecking",
+		"NetfilterKind",
 		"Persist",
 	}
 	if have := fieldsOf(reflect.TypeOf(Prefs{})); !reflect.DeepEqual(have, prefsHandles) {
@@ -292,19 +295,29 @@ func TestPrefsEqual(t *testing.T) {
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: true}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			true,
+		},
+		{
+			&Prefs{AppConnector: AppConnectorPrefs{Advertise: true}},
+			&Prefs{AppConnector: AppConnectorPrefs{Advertise: true}},
+			true,
+		},
+		{
+			&Prefs{AppConnector: AppConnectorPrefs{Advertise: true}},
+			&Prefs{AppConnector: AppConnectorPrefs{Advertise: false}},
+			false,
 		},
 		{
 			&Prefs{PostureChecking: true},
@@ -314,6 +327,16 @@ func TestPrefsEqual(t *testing.T) {
 		{
 			&Prefs{PostureChecking: true},
 			&Prefs{PostureChecking: false},
+			false,
+		},
+		{
+			&Prefs{NetfilterKind: "iptables"},
+			&Prefs{NetfilterKind: "iptables"},
+			true,
+		},
+		{
+			&Prefs{NetfilterKind: "nftables"},
+			&Prefs{NetfilterKind: ""},
 			false,
 		},
 	}
@@ -500,7 +523,7 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: false,
+					Apply: opt.NewBool(false),
 				},
 			},
 			"linux",
@@ -510,11 +533,43 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: true,
+					Apply: opt.NewBool(true),
 				},
 			},
 			"linux",
 			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=on Persist=nil}`,
+		},
+		{
+			Prefs{
+				AppConnector: AppConnectorPrefs{
+					Advertise: true,
+				},
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off appconnector=advertise Persist=nil}`,
+		},
+		{
+			Prefs{
+				AppConnector: AppConnectorPrefs{
+					Advertise: false,
+				},
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
+		},
+		{
+			Prefs{
+				NetfilterKind: "iptables",
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off netfilterKind=iptables update=off Persist=nil}`,
+		},
+		{
+			Prefs{
+				NetfilterKind: "",
+			},
+			"linux",
+			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
 		},
 	}
 	for i, tt := range tests {
@@ -706,6 +761,42 @@ func TestMaskedPrefsPretty(t *testing.T) {
 				ExitNodeIPSet: true,
 			},
 			want: `MaskedPrefs{ExitNodeIP=100.102.104.105}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: false},
+			},
+			want: `MaskedPrefs{AutoUpdate={Check=true}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: true},
+			},
+			want: `MaskedPrefs{AutoUpdate={Check=true Apply=true}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: true},
+			},
+			want: `MaskedPrefs{AutoUpdate={Apply=false}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: false},
+			},
+			want: `MaskedPrefs{}`,
 		},
 	}
 	for i, tt := range tests {

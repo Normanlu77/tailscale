@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -17,12 +18,13 @@ import (
 	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/util/cmpx"
 )
 
 var exitNodeCmd = &ffcli.Command{
 	Name:       "exit-node",
 	ShortUsage: "exit-node [flags]",
+	ShortHelp:  "Show machines on your tailnet configured as exit nodes",
+	LongHelp:   "Show machines on your tailnet configured as exit nodes",
 	Subcommands: []*ffcli.Command{
 		{
 			Name:       "list",
@@ -228,7 +230,7 @@ func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string)
 // by location.Priority, in order of highest priority.
 func sortPeersByPriority(peers []*ipnstate.PeerStatus) {
 	slices.SortStableFunc(peers, func(a, b *ipnstate.PeerStatus) int {
-		return cmpx.Compare(b.Location.Priority, a.Location.Priority)
+		return cmp.Compare(b.Location.Priority, a.Location.Priority)
 	})
 }
 

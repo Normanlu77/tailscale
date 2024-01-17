@@ -202,7 +202,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		lah := localapi.NewHandler(lb, s.logf, s.netMon, s.backendLogID)
 		lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
 		lah.PermitCert = s.connCanFetchCerts(ci)
-		lah.CallerIsLocalAdmin = s.connIsLocalAdmin(ci)
+		lah.ConnIdentity = ci
 		lah.ServeHTTP(w, r)
 		return
 	}
@@ -249,6 +249,12 @@ func (s *Server) checkConnIdentityLocked(ci *ipnauth.ConnIdentity) error {
 				defer chkTok.Close()
 			} else if !errors.Is(err, ipnauth.ErrNotImplemented) {
 				return err
+			}
+
+			// Always allow Windows SYSTEM user to connect,
+			// even if Tailscale is currently being used by another user.
+			if chkTok != nil && chkTok.IsLocalSystem() {
+				return nil
 			}
 
 			activeTok, err := active.WindowsToken()
@@ -364,31 +370,6 @@ func (s *Server) connCanFetchCerts(ci *ipnauth.ConnIdentity) bool {
 	return false
 }
 
-// connIsLocalAdmin reports whether ci has administrative access to the local
-// machine, for whatever that means with respect to the current OS.
-//
-// This returns true only on Windows machines when the client user is a
-// member of the built-in Administrators group (but not necessarily elevated).
-// This is useful because, on Windows, tailscaled itself always runs with
-// elevated rights: we want to avoid privilege escalation for certain mutative operations.
-func (s *Server) connIsLocalAdmin(ci *ipnauth.ConnIdentity) bool {
-	tok, err := ci.WindowsToken()
-	if err != nil {
-		if !errors.Is(err, ipnauth.ErrNotImplemented) {
-			s.logf("ipnauth.ConnIdentity.WindowsToken() error: %v", err)
-		}
-		return false
-	}
-	defer tok.Close()
-
-	isAdmin, err := tok.IsAdministrator()
-	if err != nil {
-		s.logf("ipnauth.WindowsToken.IsAdministrator() error: %v", err)
-		return false
-	}
-	return isAdmin
-}
-
 // addActiveHTTPRequest adds c to the server's list of active HTTP requests.
 //
 // If the returned error may be of type inUseOtherUserError.
@@ -426,8 +407,10 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, ci *ipnauth.ConnIdentit
 			if !errors.Is(err, ipnauth.ErrNotImplemented) {
 				s.logf("error obtaining access token: %v", err)
 			}
-		} else {
-			// Tell the LocalBackend about the identity we're now running as.
+		} else if !token.IsLocalSystem() {
+			// Tell the LocalBackend about the identity we're now running as,
+			// unless its the SYSTEM user. That user is not a real account and
+			// doesn't have a home directory.
 			uid, err := lb.SetCurrentUser(token)
 			if err != nil {
 				token.Close()

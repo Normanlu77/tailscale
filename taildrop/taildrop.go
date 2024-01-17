@@ -67,8 +67,9 @@ func (id ClientID) partialSuffix() string {
 
 // ManagerOptions are options to configure the [Manager].
 type ManagerOptions struct {
-	Logf  logger.Logf
-	Clock tstime.DefaultClock
+	Logf  logger.Logf         // may be nil
+	Clock tstime.DefaultClock // may be nil
+	State ipn.StateStore      // may be nil
 
 	// Dir is the directory to store received files.
 	// This main either be the final location for the files
@@ -88,15 +89,6 @@ type ManagerOptions struct {
 	// They are only used to check whether files are in the staging directory,
 	// copy them out, and then delete them.
 	DirectFileMode bool
-
-	// AvoidFinalRename specifies whether in DirectFileMode
-	// we should avoid renaming "foo.jpg.partial" to "foo.jpg" after reception.
-	//
-	// TODO(joetsai,rhea): Delete this. This is currently depended upon
-	// in the Apple platforms since it violates the abstraction layer
-	// and directly assumes how taildrop represents partial files.
-	// Right now, file resumption does not work on Apple.
-	AvoidFinalRename bool
 
 	// SendFileNotify is called periodically while a file is actively
 	// receiving the contents for the file. There is a final call
@@ -168,7 +160,7 @@ func validFilenameRune(r rune) bool {
 		// sent.
 		return false
 	}
-	return unicode.IsPrint(r)
+	return unicode.IsGraphic(r)
 }
 
 func isPartialOrDeleted(s string) bool {
@@ -243,6 +235,7 @@ func (m *Manager) IncomingFiles() []ipn.PartialFile {
 			DeclaredSize: f.size,
 			Received:     f.copied,
 			PartialPath:  f.partialPath,
+			FinalPath:    f.finalPath,
 			Done:         f.done,
 		})
 		return true

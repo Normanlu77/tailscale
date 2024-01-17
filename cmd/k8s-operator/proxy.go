@@ -6,7 +6,6 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -21,27 +20,14 @@ import (
 	"k8s.io/client-go/transport"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/hostinfo"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
-	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/set"
 )
 
-type whoIsKey struct{}
-
-// whoIsFromRequest returns the WhoIsResponse previously stashed by a call to
-// addWhoIsToRequest.
-func whoIsFromRequest(r *http.Request) *apitype.WhoIsResponse {
-	return r.Context().Value(whoIsKey{}).(*apitype.WhoIsResponse)
-}
-
-// addWhoIsToRequest stashes who in r's context, retrievable by a call to
-// whoIsFromRequest.
-func addWhoIsToRequest(r *http.Request, who *apitype.WhoIsResponse) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), whoIsKey{}, who))
-}
+var whoIsKey = ctxkey.New("", (*apitype.WhoIsResponse)(nil))
 
 var counterNumRequestsProxied = clientmetric.NewCounter("k8s_auth_proxy_requests_proxied")
 
@@ -84,13 +70,14 @@ func parseAPIProxyMode() apiServerProxyMode {
 // maybeLaunchAPIServerProxy launches the auth proxy, which is a small HTTP server
 // that authenticates requests using the Tailscale LocalAPI and then proxies
 // them to the kube-apiserver.
-func maybeLaunchAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, s *tsnet.Server) {
-	mode := parseAPIProxyMode()
+func maybeLaunchAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, s *tsnet.Server, mode apiServerProxyMode) {
 	if mode == apiserverProxyModeDisabled {
 		return
 	}
-	hostinfo.SetApp("k8s-operator-proxy")
 	startlog := zlog.Named("launchAPIProxy")
+	if mode == apiserverProxyModeNoAuth {
+		restConfig = rest.AnonymousClientConfig(restConfig)
+	}
 	cfg, err := restConfig.TransportConfig()
 	if err != nil {
 		startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
@@ -109,26 +96,26 @@ func maybeLaunchAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config,
 	if err != nil {
 		startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
 	}
-	go runAPIServerProxy(s, rt, zlog.Named("apiserver-proxy").Infof, mode)
+	go runAPIServerProxy(s, rt, zlog.Named("apiserver-proxy"), mode)
 }
 
 // apiserverProxy is an http.Handler that authenticates requests using the Tailscale
 // LocalAPI and then proxies them to the Kubernetes API.
 type apiserverProxy struct {
-	logf logger.Logf
-	lc   *tailscale.LocalClient
-	rp   *httputil.ReverseProxy
+	log *zap.SugaredLogger
+	lc  *tailscale.LocalClient
+	rp  *httputil.ReverseProxy
 }
 
 func (h *apiserverProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	who, err := h.lc.WhoIs(r.Context(), r.RemoteAddr)
 	if err != nil {
-		h.logf("failed to authenticate caller: %v", err)
+		h.log.Errorf("failed to authenticate caller: %v", err)
 		http.Error(w, "failed to authenticate caller", http.StatusInternalServerError)
 		return
 	}
 	counterNumRequestsProxied.Add(1)
-	h.rp.ServeHTTP(w, addWhoIsToRequest(r, who))
+	h.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
 }
 
 // runAPIServerProxy runs an HTTP server that authenticates requests using the
@@ -145,7 +132,7 @@ func (h *apiserverProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //     are passed through to the Kubernetes API.
 //
 // It never returns.
-func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, logf logger.Logf, mode apiServerProxyMode) {
+func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLogger, mode apiServerProxyMode) {
 	if mode == apiserverProxyModeDisabled {
 		return
 	}
@@ -163,13 +150,14 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, logf logger.Logf, 
 		log.Fatalf("could not get local client: %v", err)
 	}
 	ap := &apiserverProxy{
-		logf: logf,
-		lc:   lc,
+		log: log,
+		lc:  lc,
 		rp: &httputil.ReverseProxy{
-			Director: func(r *http.Request) {
+			Rewrite: func(r *httputil.ProxyRequest) {
 				// Replace the URL with the Kubernetes APIServer.
-				r.URL.Scheme = u.Scheme
-				r.URL.Host = u.Host
+
+				r.Out.URL.Scheme = u.Scheme
+				r.Out.URL.Host = u.Host
 				if mode == apiserverProxyModeNoAuth {
 					// If we are not providing authentication, then we are just
 					// proxying to the Kubernetes API, so we don't need to do
@@ -184,18 +172,18 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, logf logger.Logf, 
 
 				// Out of paranoia, remove all authentication headers that might
 				// have been set by the client.
-				r.Header.Del("Authorization")
-				r.Header.Del("Impersonate-Group")
-				r.Header.Del("Impersonate-User")
-				r.Header.Del("Impersonate-Uid")
-				for k := range r.Header {
+				r.Out.Header.Del("Authorization")
+				r.Out.Header.Del("Impersonate-Group")
+				r.Out.Header.Del("Impersonate-User")
+				r.Out.Header.Del("Impersonate-Uid")
+				for k := range r.Out.Header {
 					if strings.HasPrefix(k, "Impersonate-Extra-") {
-						r.Header.Del(k)
+						r.Out.Header.Del(k)
 					}
 				}
 
 				// Now add the impersonation headers that we want.
-				if err := addImpersonationHeaders(r); err != nil {
+				if err := addImpersonationHeaders(r.Out, log); err != nil {
 					panic("failed to add impersonation headers: " + err.Error())
 				}
 			},
@@ -212,12 +200,16 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, logf logger.Logf, 
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 		Handler:      ap,
 	}
+	log.Infof("listening on %s", ln.Addr())
 	if err := hs.ServeTLS(ln, "", ""); err != nil {
 		log.Fatalf("runAPIServerProxy: failed to serve %v", err)
 	}
 }
 
-const capabilityName = "https://tailscale.com/cap/kubernetes"
+const (
+	capabilityName    = "tailscale.com/cap/kubernetes"
+	oldCapabilityName = "https://" + capabilityName
+)
 
 type capRule struct {
 	// Impersonate is a list of rules that specify how to impersonate the caller
@@ -234,9 +226,14 @@ type impersonateRule struct {
 // addImpersonationHeaders adds the appropriate headers to r to impersonate the
 // caller when proxying to the Kubernetes API. It uses the WhoIsResponse stashed
 // in the context by the apiserverProxy.
-func addImpersonationHeaders(r *http.Request) error {
-	who := whoIsFromRequest(r)
+func addImpersonationHeaders(r *http.Request, log *zap.SugaredLogger) error {
+	log = log.With("remote", r.RemoteAddr)
+	who := whoIsKey.Value(r.Context())
 	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, capabilityName)
+	if len(rules) == 0 && err == nil {
+		// Try the old capability name for backwards compatibility.
+		rules, err = tailcfg.UnmarshalCapJSON[capRule](who.CapMap, oldCapabilityName)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal capability: %v", err)
 	}
@@ -252,21 +249,26 @@ func addImpersonationHeaders(r *http.Request) error {
 			}
 			r.Header.Add("Impersonate-Group", group)
 			groupsAdded.Add(group)
+			log.Debugf("adding group impersonation header for user group %s", group)
 		}
 	}
 
 	if !who.Node.IsTagged() {
 		r.Header.Set("Impersonate-User", who.UserProfile.LoginName)
+		log.Debugf("adding user impersonation header for user %s", who.UserProfile.LoginName)
 		return nil
 	}
 	// "Impersonate-Group" requires "Impersonate-User" to be set, so we set it
 	// to the node FQDN for tagged nodes.
-	r.Header.Set("Impersonate-User", strings.TrimSuffix(who.Node.Name, "."))
+	nodeName := strings.TrimSuffix(who.Node.Name, ".")
+	r.Header.Set("Impersonate-User", nodeName)
+	log.Debugf("adding user impersonation header for node name %s", nodeName)
 
 	// For legacy behavior (before caps), set the groups to the nodes tags.
 	if groupsAdded.Slice().Len() == 0 {
 		for _, tag := range who.Node.Tags {
 			r.Header.Add("Impersonate-Group", tag)
+			log.Debugf("adding group impersonation header for node tag %s", tag)
 		}
 	}
 	return nil

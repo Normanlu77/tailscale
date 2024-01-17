@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
@@ -41,6 +42,7 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 	"tailscale.com/util/rands"
@@ -872,6 +874,99 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 	wantNode0PeerCount(expectedPeers) // all existing peers and the new node
 }
 
+func TestAutoUpdateDefaults(t *testing.T) {
+	if !clientupdate.CanAutoUpdate() {
+		t.Skip("auto-updates not supported on this platform")
+	}
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := newTestEnv(t)
+
+	checkDefault := func(n *testNode, want bool) error {
+		enabled, ok := n.diskPrefs().AutoUpdate.Apply.Get()
+		if !ok {
+			return fmt.Errorf("auto-update for node is unset, should be set as %v", want)
+		}
+		if enabled != want {
+			return fmt.Errorf("auto-update for node is %v, should be set as %v", enabled, want)
+		}
+		return nil
+	}
+
+	sendAndCheckDefault := func(t *testing.T, n *testNode, send, want bool) {
+		t.Helper()
+		if !env.Control.AddRawMapResponse(n.MustStatus().Self.PublicKey, &tailcfg.MapResponse{
+			DefaultAutoUpdate: opt.NewBool(send),
+		}) {
+			t.Fatal("failed to send MapResponse to node")
+		}
+		if err := tstest.WaitFor(2*time.Second, func() error {
+			return checkDefault(n, want)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		desc string
+		run  func(t *testing.T, n *testNode)
+	}{
+		{
+			desc: "tailnet-default-false",
+			run: func(t *testing.T, n *testNode) {
+				// First received default "false".
+				sendAndCheckDefault(t, n, false, false)
+				// Should not be changed even if sent "true" later.
+				sendAndCheckDefault(t, n, true, false)
+				// But can be changed explicitly by the user.
+				if out, err := n.Tailscale("set", "--auto-update").CombinedOutput(); err != nil {
+					t.Fatalf("failed to enable auto-update on node: %v\noutput: %s", err, out)
+				}
+				sendAndCheckDefault(t, n, false, true)
+			},
+		},
+		{
+			desc: "tailnet-default-true",
+			run: func(t *testing.T, n *testNode) {
+				// First received default "true".
+				sendAndCheckDefault(t, n, true, true)
+				// Should not be changed even if sent "false" later.
+				sendAndCheckDefault(t, n, false, true)
+				// But can be changed explicitly by the user.
+				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
+				}
+				sendAndCheckDefault(t, n, true, false)
+			},
+		},
+		{
+			desc: "user-sets-first",
+			run: func(t *testing.T, n *testNode) {
+				// User sets auto-update first, before receiving defaults.
+				if out, err := n.Tailscale("set", "--auto-update=false").CombinedOutput(); err != nil {
+					t.Fatalf("failed to disable auto-update on node: %v\noutput: %s", err, out)
+				}
+				// Defaults sent from control should be ignored.
+				sendAndCheckDefault(t, n, true, false)
+				sendAndCheckDefault(t, n, false, false)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			n := newTestNode(t, env)
+			d := n.StartDaemon()
+			defer d.MustCleanShutdown(t)
+
+			n.AwaitResponding()
+			n.MustUp()
+			n.AwaitRunning()
+
+			tt.run(t, n)
+		})
+	}
+}
+
 // testEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type testEnv struct {
@@ -1226,9 +1321,8 @@ func (n *testNode) Ping(otherNode *testNode) error {
 // over its localhost IPC mechanism. (Unix socket, etc)
 func (n *testNode) AwaitListening() {
 	t := n.env.t
-	s := safesocket.DefaultConnectionStrategy(n.sockFile)
 	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.Connect(s)
+		c, err := safesocket.Connect(n.sockFile)
 		if err == nil {
 			c.Close()
 		}

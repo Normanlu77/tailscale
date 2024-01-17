@@ -5,6 +5,7 @@
 package set
 
 import (
+	"encoding/json"
 	"maps"
 )
 
@@ -19,7 +20,7 @@ func SetOf[T comparable](slice []T) Set[T] {
 }
 
 // Clone returns a new set cloned from the elements in s.
-func Clone[T comparable](s Set[T]) Set[T] {
+func (s Set[T]) Clone() Set[T] {
 	return maps.Clone(s)
 }
 
@@ -65,4 +66,17 @@ func (s Set[T]) Len() int { return len(s) }
 // Equal reports whether s is equal to other.
 func (s Set[T]) Equal(other Set[T]) bool {
 	return maps.Equal(s, other)
+}
+
+func (s Set[T]) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.Slice())
+}
+
+func (s *Set[T]) UnmarshalJSON(buf []byte) error {
+	var ss []T
+	if err := json.Unmarshal(buf, &ss); err != nil {
+		return err
+	}
+	*s = SetOf(ss)
+	return nil
 }

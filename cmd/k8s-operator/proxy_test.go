@@ -10,12 +10,17 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"go.uber.org/zap"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/must"
 )
 
 func TestImpersonationHeaders(t *testing.T) {
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name     string
 		emailish string
@@ -90,7 +95,7 @@ func TestImpersonationHeaders(t *testing.T) {
 
 	for _, tc := range tests {
 		r := must.Get(http.NewRequest("GET", "https://op.ts.net/api/foo", nil))
-		r = addWhoIsToRequest(r, &apitype.WhoIsResponse{
+		r = r.WithContext(whoIsKey.WithValue(r.Context(), &apitype.WhoIsResponse{
 			Node: &tailcfg.Node{
 				Name: "node.ts.net",
 				Tags: tc.tags,
@@ -99,8 +104,8 @@ func TestImpersonationHeaders(t *testing.T) {
 				LoginName: tc.emailish,
 			},
 			CapMap: tc.capMap,
-		})
-		addImpersonationHeaders(r)
+		}))
+		addImpersonationHeaders(r, zl.Sugar())
 
 		if d := cmp.Diff(tc.wantHeaders, r.Header); d != "" {
 			t.Errorf("unexpected header (-want +got):\n%s", d)

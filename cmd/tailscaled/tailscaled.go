@@ -85,20 +85,6 @@ func defaultTunName() string {
 			// Try TUN, but fall back to userspace networking if needed.
 			// See https://github.com/tailscale/tailscale-synology/issues/35
 			return "tailscale0,userspace-networking"
-		case distro.Gokrazy:
-			// Gokrazy doesn't yet work in tun mode because the whole
-			// Gokrazy thing is no C code, and Tailscale currently
-			// depends on the iptables binary for Linux's
-			// wgengine/router.
-			// But on Gokrazy there's no legacy iptables, so we could use netlink
-			// to program nft-iptables directly. It just isn't done yet;
-			// see https://github.com/tailscale/tailscale/issues/391
-			//
-			// But Gokrazy does have the tun module built-in, so users
-			// can still run --tun=tailscale0 if they wish, if they
-			// arrange for iptables to be present or run in "tailscale
-			// up --netfilter-mode=off" mode, perhaps. Untested.
-			return "userspace-networking"
 		}
 
 	}
@@ -338,7 +324,7 @@ func ipnServerOpts() (o serverOptions) {
 var logPol *logpolicy.Policy
 var debugMux *http.ServeMux
 
-func run() error {
+func run() (err error) {
 	var logf logger.Logf = log.Printf
 
 	sys := new(tsd.System)
@@ -346,7 +332,6 @@ func run() error {
 	// Parse config, if specified, to fail early if it's invalid.
 	var conf *conffile.Config
 	if args.confFile != "" {
-		var err error
 		conf, err = conffile.Load(args.confFile)
 		if err != nil {
 			return fmt.Errorf("error reading config file: %w", err)
@@ -354,13 +339,17 @@ func run() error {
 		sys.InitialConfig = conf
 	}
 
-	netMon, err := netmon.New(func(format string, args ...any) {
-		logf(format, args...)
-	})
-	if err != nil {
-		return fmt.Errorf("netmon.New: %w", err)
+	var netMon *netmon.Monitor
+	isWinSvc := isWindowsService()
+	if !isWinSvc {
+		netMon, err = netmon.New(func(format string, args ...any) {
+			logf(format, args...)
+		})
+		if err != nil {
+			return fmt.Errorf("netmon.New: %w", err)
+		}
+		sys.Set(netMon)
 	}
-	sys.Set(netMon)
 
 	pol := logpolicy.New(logtail.CollectionNode, netMon, nil /* use log.Printf */)
 	pol.SetVerbosityLevel(args.verbose)
@@ -376,7 +365,7 @@ func run() error {
 		log.Printf("Error reading environment config: %v", err)
 	}
 
-	if isWindowsService() {
+	if isWinSvc {
 		// Run the IPN server from the Windows service manager.
 		log.Printf("Running service...")
 		if err := runWindowsService(pol); err != nil {
@@ -522,7 +511,13 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 			return ok
 		}
 		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-			return ns.DialContextTCP(ctx, dst)
+			// Note: don't just return ns.DialContextTCP or we'll
+			// return an interface containing a nil pointer.
+			tcpConn, err := ns.DialContextTCP(ctx, dst)
+			if err != nil {
+				return nil, err
+			}
+			return tcpConn, nil
 		}
 	}
 	if socksListener != nil || httpProxyListener != nil {
@@ -570,9 +565,10 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 	if root := lb.TailscaleVarRoot(); root != "" {
 		dnsfallback.SetCachePath(filepath.Join(root, "derpmap.cached.json"), logf)
 	}
-	if envknob.Bool("TS_DEBUG_WEB_UI") {
-		lb.SetWebLocalClient(&tailscale.LocalClient{Socket: args.socketpath, UseSocketOnly: args.socketpath != ""})
-	}
+	lb.ConfigureWebClient(&tailscale.LocalClient{
+		Socket:        args.socketpath,
+		UseSocketOnly: args.socketpath != paths.DefaultTailscaledSocket(),
+	})
 	configureTaildrop(logf, lb)
 	if err := ns.Start(lb); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)

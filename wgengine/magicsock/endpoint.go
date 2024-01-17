@@ -49,9 +49,9 @@ func init() {
 // there is only one endpoint for a peer, but in Tailscale we distribute a
 // number of possible endpoints for a peer which would include the all the
 // likely addresses at which a peer may be reachable. This endpoint type holds
-// the information required that when WiregGuard-Go wants to send to a
-// particular peer (essentally represented by this endpoint type), the send
-// function can use the currnetly best known Tailscale endpoint to send packets
+// the information required that when wireguard-go wants to send to a
+// particular peer (essentially represented by this endpoint type), the send
+// function can use the currently best known Tailscale endpoint to send packets
 // to the peer.
 type endpoint struct {
 	// atomically accessed; declared first for alignment reasons
@@ -239,13 +239,21 @@ func (de *endpoint) initFakeUDPAddr() {
 func (de *endpoint) noteRecvActivity(ipp netip.AddrPort) {
 	now := mono.Now()
 
-	// TODO(raggi): this probably applies relatively equally well to disco
-	// managed endpoints, but that would be a less conservative change.
 	if de.isWireguardOnly {
 		de.mu.Lock()
 		de.bestAddr.AddrPort = ipp
 		de.bestAddrAt = now
 		de.trustBestAddrUntil = now.Add(5 * time.Second)
+		de.mu.Unlock()
+	} else {
+		// TODO(jwhited): subject to change as part of silent disco effort.
+		// Necessary when heartbeat is disabled for the endpoint, otherwise we
+		// kick off discovery disco pings every trustUDPAddrDuration and mirror
+		// to DERP.
+		de.mu.Lock()
+		if de.heartbeatDisabled && de.bestAddr.AddrPort == ipp {
+			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
+		}
 		de.mu.Unlock()
 	}
 
@@ -440,6 +448,13 @@ func (de *endpoint) heartbeat() {
 	de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
 }
 
+// setHeartbeatDisabled sets heartbeatDisabled to the provided value.
+func (de *endpoint) setHeartbeatDisabled(v bool) {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	de.heartbeatDisabled = v
+}
+
 // wantFullPingLocked reports whether we should ping to all our peers looking for
 // a better path.
 //
@@ -629,7 +644,7 @@ const discoPingSize = len(disco.Magic) + key.DiscoPublicRawLen + disco.NonceLen 
 // is the desired disco message size, including all disco headers but excluding IP/UDP
 // headers.
 //
-// The caller (startPingLocked) should've already recorded the ping in
+// The caller (startDiscoPingLocked) should've already recorded the ping in
 // sentPing and set up the timer.
 //
 // The caller should use de.discoKey as the discoKey argument.
@@ -775,7 +790,7 @@ func (de *endpoint) sendWireGuardOnlyPingsLocked(now mono.Time) {
 		return
 	}
 
-	// Normally the we only send pings at a low rate as the decision to start
+	// Normally we only send pings at a low rate as the decision to start
 	// sending a ping sets bestAddrAtUntil with a reasonable time to keep trying
 	// that address, however, if that code changed we may want to be sure that
 	// we don't ever send excessive pings to avoid impact to the client/user.
@@ -1335,7 +1350,11 @@ func (de *endpoint) stopAndReset() {
 	defer de.mu.Unlock()
 
 	if closing := de.c.closing.Load(); !closing {
-		de.c.logf("[v1] magicsock: doing cleanup for discovery key %s", de.discoShort())
+		if de.isWireguardOnly {
+			de.c.logf("[v1] magicsock: doing cleanup for wireguard key %s", de.publicKey.ShortString())
+		} else {
+			de.c.logf("[v1] magicsock: doing cleanup for discovery key %s", de.discoShort())
+		}
 	}
 
 	de.debugUpdates.Add(EndpointChange{
@@ -1359,8 +1378,10 @@ func (de *endpoint) resetLocked() {
 	for _, es := range de.endpointState {
 		es.lastPing = 0
 	}
-	for txid, sp := range de.sentPing {
-		de.removeSentDiscoPingLocked(txid, sp)
+	if !de.isWireguardOnly {
+		for txid, sp := range de.sentPing {
+			de.removeSentDiscoPingLocked(txid, sp)
+		}
 	}
 }
 

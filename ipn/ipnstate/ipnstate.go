@@ -22,6 +22,7 @@ import (
 	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/version"
 )
 
 //go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TKAFilteredPeer
@@ -215,6 +216,8 @@ type PeerStatus struct {
 
 	// TailscaleIPs are the IP addresses assigned to the node.
 	TailscaleIPs []netip.Addr
+	// AllowedIPs are IP addresses allowed to route to this node.
+	AllowedIPs *views.Slice[netip.Prefix] `json:",omitempty"`
 
 	// Tags are the list of ACL tags applied to this node.
 	// See tailscale.com/tailcfg#Node.Tags for more information.
@@ -412,6 +415,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	}
 	if v := st.PrimaryRoutes; v != nil && !v.IsNil() {
 		e.PrimaryRoutes = v
+	}
+	if v := st.AllowedIPs; v != nil && !v.IsNil() {
+		e.AllowedIPs = v
 	}
 	if v := st.Tags; v != nil && !v.IsNil() {
 		e.Tags = v
@@ -709,4 +715,26 @@ type DebugDERPRegionReport struct {
 	Info     []string
 	Warnings []string
 	Errors   []string
+}
+
+type SelfUpdateStatus string
+
+const (
+	UpdateFinished   SelfUpdateStatus = "UpdateFinished"
+	UpdateInProgress SelfUpdateStatus = "UpdateInProgress"
+	UpdateFailed     SelfUpdateStatus = "UpdateFailed"
+)
+
+type UpdateProgress struct {
+	Status  SelfUpdateStatus `json:"status,omitempty"`
+	Message string           `json:"message,omitempty"`
+	Version string           `json:"version,omitempty"`
+}
+
+func NewUpdateProgress(ps SelfUpdateStatus, msg string) UpdateProgress {
+	return UpdateProgress{
+		Status:  ps,
+		Message: msg,
+		Version: version.Short(),
+	}
 }

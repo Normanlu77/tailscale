@@ -14,14 +14,13 @@ import (
 )
 
 var (
-	addr    = flag.String("addr", "localhost:8060", "address of Tailscale web client")
-	devMode = flag.Bool("dev", false, "run web client in dev mode")
+	addr = flag.String("addr", "localhost:8060", "address of Tailscale web client")
 )
 
 func main() {
 	flag.Parse()
 
-	s := new(tsnet.Server)
+	s := &tsnet.Server{RunWebClient: true}
 	defer s.Close()
 
 	lc, err := s.LocalClient()
@@ -31,7 +30,7 @@ func main() {
 
 	// Serve the Tailscale web client.
 	ws, err := web.NewServer(web.ServerOpts{
-		DevMode:     *devMode,
+		Mode:        web.LoginServerMode,
 		LocalClient: lc,
 	})
 	if err != nil {

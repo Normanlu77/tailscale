@@ -12,11 +12,13 @@ import (
 	"os/exec"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/client/web"
 	"tailscale.com/clientupdate"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
 	"tailscale.com/version"
 )
@@ -42,9 +44,11 @@ type setArgsT struct {
 	exitNodeAllowLANAccess bool
 	shieldsUp              bool
 	runSSH                 bool
+	runWebClient           bool
 	hostname               string
 	advertiseRoutes        string
 	advertiseDefaultRoute  bool
+	advertiseConnector     bool
 	opUser                 string
 	acceptedRisks          string
 	profileName            string
@@ -67,9 +71,11 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.StringVar(&setArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
 	setf.StringVar(&setArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\") or empty string to not advertise routes")
 	setf.BoolVar(&setArgs.advertiseDefaultRoute, "advertise-exit-node", false, "offer to be an exit node for internet traffic for the tailnet")
+	setf.BoolVar(&setArgs.advertiseConnector, "advertise-connector", false, "offer to be an app connector for domain specific internet traffic for the tailnet")
 	setf.BoolVar(&setArgs.updateCheck, "update-check", true, "notify about available Tailscale updates")
 	setf.BoolVar(&setArgs.updateApply, "auto-update", false, "automatically update to the latest available version")
 	setf.BoolVar(&setArgs.postureChecking, "posture-checking", false, "HIDDEN: allow management plane to gather device posture information")
+	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "run a web interface for managing this node, served over Tailscale at port 5252")
 
 	if safesocket.GOOSUsesPeerCreds(goos) {
 		setf.StringVar(&setArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
@@ -106,12 +112,16 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			ExitNodeAllowLANAccess: setArgs.exitNodeAllowLANAccess,
 			ShieldsUp:              setArgs.shieldsUp,
 			RunSSH:                 setArgs.runSSH,
+			RunWebClient:           setArgs.runWebClient,
 			Hostname:               setArgs.hostname,
 			OperatorUser:           setArgs.opUser,
 			ForceDaemon:            setArgs.forceDaemon,
 			AutoUpdate: ipn.AutoUpdatePrefs{
 				Check: setArgs.updateCheck,
-				Apply: setArgs.updateApply,
+				Apply: opt.NewBool(setArgs.updateApply),
+			},
+			AppConnector: ipn.AppConnectorPrefs{
+				Advertise: setArgs.advertiseConnector,
 			},
 			PostureChecking: setArgs.postureChecking,
 		},
@@ -127,6 +137,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 		}
 	}
 
+	warnOnAdvertiseRouts(ctx, &maskedPrefs.Prefs)
 	var advertiseExitNodeSet, advertiseRoutesSet bool
 	setFlagSet.Visit(func(f *flag.Flag) {
 		updateMaskedPrefsFromUpOrSetFlag(maskedPrefs, f.Name)
@@ -158,12 +169,12 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 	}
-	if maskedPrefs.AutoUpdateSet {
+	if maskedPrefs.AutoUpdateSet.ApplySet {
 		// On macsys, tailscaled will set the Sparkle auto-update setting. It
 		// does not use clientupdate.
 		if version.IsMacSysExt() {
 			apply := "0"
-			if maskedPrefs.AutoUpdate.Apply {
+			if maskedPrefs.AutoUpdate.Apply.EqualBool(true) {
 				apply = "1"
 			}
 			out, err := exec.Command("defaults", "write", "io.tailscale.ipn.macsys", "SUAutomaticallyUpdate", apply).CombinedOutput()
@@ -171,8 +182,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 				return fmt.Errorf("failed to enable automatic updates: %v, %q", err, out)
 			}
 		} else {
-			_, err := clientupdate.NewUpdater(clientupdate.Arguments{ForAutoUpdate: true})
-			if errors.Is(err, errors.ErrUnsupported) {
+			if !clientupdate.CanAutoUpdate() {
 				return errors.New("automatic updates are not supported on this platform")
 			}
 		}
@@ -184,7 +194,15 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	_, err = localClient.EditPrefs(ctx, maskedPrefs)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if setArgs.runWebClient && len(st.TailscaleIPs) > 0 {
+		printf("\nWeb interface now running at %s:%d", st.TailscaleIPs[0], web.ListenPort)
+	}
+
+	return nil
 }
 
 // calcAdvertiseRoutesForSet returns the new value for Prefs.AdvertiseRoutes based on the

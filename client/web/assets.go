@@ -4,6 +4,8 @@
 package web
 
 import (
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -12,9 +14,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	prebuilt "github.com/tailscale/web-client-prebuilt"
 )
+
+var start = time.Now()
 
 func assetsHandler(devMode bool) (_ http.Handler, cleanup func()) {
 	if devMode {
@@ -22,7 +27,48 @@ func assetsHandler(devMode bool) (_ http.Handler, cleanup func()) {
 		cleanup := startDevServer()
 		return devServerProxy(), cleanup
 	}
-	return http.FileServer(http.FS(prebuilt.FS())), nil
+
+	fsys := prebuilt.FS()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		f, err := openPrecompressedFile(w, r, path, fsys)
+		if err != nil {
+			// Rewrite request to just fetch index.html and let
+			// the frontend router handle it.
+			r = r.Clone(r.Context())
+			path = "index.html"
+			f, err = openPrecompressedFile(w, r, path, fsys)
+		}
+		if f == nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+
+		// fs.File does not claim to implement Seeker, but in practice it does.
+		fSeeker, ok := f.(io.ReadSeeker)
+		if !ok {
+			http.Error(w, "Not seekable", http.StatusInternalServerError)
+			return
+		}
+
+		if strings.HasPrefix(path, "assets/") {
+			// Aggressively cache static assets, since we cache-bust our assets with
+			// hashed filenames.
+			w.Header().Set("Cache-Control", "public, max-age=31535996")
+			w.Header().Set("Vary", "Accept-Encoding")
+		}
+
+		http.ServeContent(w, r, path, start, fSeeker)
+	}), nil
+}
+
+func openPrecompressedFile(w http.ResponseWriter, r *http.Request, path string, fs fs.FS) (fs.File, error) {
+	if f, err := fs.Open(path + ".gz"); err == nil {
+		w.Header().Set("Content-Encoding", "gzip")
+		return f, nil
+	}
+	return fs.Open(path) // fallback
 }
 
 // startDevServer starts the JS dev server that does on-demand rebuilding
@@ -35,7 +81,7 @@ func startDevServer() (cleanup func()) {
 	node := filepath.Join(root, "tool", "node")
 	vite := filepath.Join(webClientPath, "node_modules", ".bin", "vite")
 
-	log.Printf("installing JavaScript deps using %s... (might take ~30s)", yarn)
+	log.Printf("installing JavaScript deps using %s...", yarn)
 	out, err := exec.Command(yarn, "--non-interactive", "-s", "--cwd", webClientPath, "install").CombinedOutput()
 	if err != nil {
 		log.Fatalf("error running tailscale web's yarn install: %v, %s", err, out)

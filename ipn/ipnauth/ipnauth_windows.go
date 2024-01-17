@@ -13,13 +13,14 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/winutil"
 )
 
 // GetConnIdentity extracts the identity information from the connection
 // based on the user who owns the other end of the connection.
 // If c is not backed by a named pipe, an error is returned.
 func GetConnIdentity(logf logger.Logf, c net.Conn) (ci *ConnIdentity, err error) {
-	ci = &ConnIdentity{conn: c}
+	ci = &ConnIdentity{conn: c, notWindows: false}
 	wcc, ok := c.(*safesocket.WindowsClientConn)
 	if !ok {
 		return nil, fmt.Errorf("not a WindowsClientConn: %T", c)
@@ -64,11 +65,38 @@ func (t *token) IsAdministrator() (bool, error) {
 		return false, err
 	}
 
-	return t.t.IsMember(baSID)
+	isMember, err := t.t.IsMember(baSID)
+	if err != nil {
+		return false, err
+	}
+	if isMember {
+		return true, nil
+	}
+
+	isLimited, err := winutil.IsTokenLimited(t.t)
+	if err != nil || !isLimited {
+		return false, err
+	}
+
+	// Try to obtain a linked token, and if present, check it.
+	// (This should be the elevated token associated with limited UAC accounts.)
+	linkedToken, err := t.t.GetLinkedToken()
+	if err != nil {
+		return false, err
+	}
+	defer linkedToken.Close()
+
+	return linkedToken.IsMember(baSID)
 }
 
 func (t *token) IsElevated() bool {
 	return t.t.IsElevated()
+}
+
+func (t *token) IsLocalSystem() bool {
+	// https://web.archive.org/web/2024/https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers
+	const systemUID = ipn.WindowsUserID("S-1-5-18")
+	return t.IsUID(systemUID)
 }
 
 func (t *token) UserDir(folderID string) (string, error) {

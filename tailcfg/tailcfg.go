@@ -120,7 +120,13 @@ type CapabilityVersion int
 //   - 77: 2023-10-03: Client understands Peers[].SelfNodeV6MasqAddrForThisPeer
 //   - 78: 2023-10-05: can handle c2n Wake-on-LAN sending
 //   - 79: 2023-10-05: Client understands UrgentSecurityUpdate in ClientVersion
-const CurrentCapabilityVersion CapabilityVersion = 79
+//   - 80: 2023-11-16: can handle c2n GET /tls-cert-status
+//   - 81: 2023-11-17: MapResponse.PacketFilters (incremental packet filter updates)
+//   - 82: 2023-12-01: Client understands NodeAttrLinuxMustUseIPTables, NodeAttrLinuxMustUseNfTables, c2n /netfilter-kind
+//   - 83: 2023-12-18: Client understands DefaultAutoUpdate
+//   - 84: 2024-01-04: Client understands SeamlessKeyRenewal
+//   - 85: 2024-01-05: Client understands MaxKeyDuration
+const CurrentCapabilityVersion CapabilityVersion = 85
 
 type StableID string
 
@@ -645,7 +651,7 @@ type Service struct {
 	//     * "peerapi6": peerapi is available on IPv6; Port is the
 	//        port number that the peerapi is running on the
 	//        node's Tailscale IPv6 address.
-	//     * "peerapi-dns": the local peerapi service supports
+	//     * "peerapi-dns-proxy": the local peerapi service supports
 	//        being a DNS proxy (when the node is an exit
 	//        node). For this service, the Port number is really
 	//        the version number of the service.
@@ -744,6 +750,7 @@ type Hostinfo struct {
 	Cloud           string         `json:",omitempty"`
 	Userspace       opt.Bool       `json:",omitempty"` // if the client is running in userspace (netstack) mode
 	UserspaceRouter opt.Bool       `json:",omitempty"` // if the client's subnet router is running in userspace (netstack) mode
+	AppConnector    opt.Bool       `json:",omitempty"` // if the client is running the app-connector service
 
 	// Location represents geographical location data about a
 	// Tailscale host. Location is optional and only set if
@@ -1334,6 +1341,9 @@ const (
 	PeerCapabilityWakeOnLAN PeerCapability = "https://tailscale.com/cap/wake-on-lan"
 	// PeerCapabilityIngress grants the ability for a peer to send ingress traffic.
 	PeerCapabilityIngress PeerCapability = "https://tailscale.com/cap/ingress"
+	// PeerCapabilityWebUI grants the ability for a peer to edit features from the
+	// device Web UI.
+	PeerCapabilityWebUI PeerCapability = "tailscale.com/cap/webui"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -1795,7 +1805,33 @@ type MapResponse struct {
 	// Note that this package's type, due its use of a slice and omitempty, is
 	// unable to marshal a zero-length non-nil slice. The control server needs
 	// to marshal this type using a separate type. See MapResponse docs.
+	//
+	// See PacketFilters for the newer way to send PacketFilter updates.
 	PacketFilter []FilterRule `json:",omitempty"`
+
+	// PacketFilters encodes incremental packet filter updates to the client
+	// without having to send the entire packet filter on any changes as
+	// required by the older PacketFilter (singular) field above. The map keys
+	// are server-assigned arbitrary strings. The map values are the new rules
+	// for that key, or nil to delete it. The client then concatenates all the
+	// rules together to generate the final packet filter. Because the
+	// FilterRules can only match or not match, the ordering of filter rules
+	// doesn't matter. (That said, the client generates the file merged packet
+	// filter rules by concananting all the packet filter rules sorted by the
+	// map key name. But it does so for stability and testability, not
+	// correctness. If something needs to rely on that property, something has
+	// gone wrong.)
+	//
+	// If the server sends a non-nil PacketFilter (above), that is equivalent to
+	// a named packet filter with the key "base". It is valid for the server to
+	// send both PacketFilter and PacketFilters in the same MapResponse or
+	// alternate between them within a session. The PacketFilter is applied
+	// first (if set) and then the PacketFilters.
+	//
+	// As a special case, the map key "*" with a value of nil means to clear all
+	// prior named packet filters (including any implicit "base") before
+	// processing the other map entries.
+	PacketFilters map[string][]FilterRule `json:",omitempty"`
 
 	// UserProfiles are the user profiles of nodes in the network.
 	// As as of 1.1.541 (mapver 5), this contains new or updated
@@ -1847,6 +1883,17 @@ type MapResponse struct {
 	// download and whether the client is using it. A nil value means no change
 	// or nothing to report.
 	ClientVersion *ClientVersion `json:",omitempty"`
+
+	// DefaultAutoUpdate is the default node auto-update setting for this
+	// tailnet. The node is free to opt-in or out locally regardless of this
+	// value. This value is only used on first MapResponse from control, the
+	// auto-update setting doesn't change if the tailnet admin flips the
+	// default after the node registered.
+	DefaultAutoUpdate opt.Bool `json:",omitempty"`
+
+	// MaxKeyDuration describes the MaxKeyDuration setting for the tailnet.
+	// If zero, the value is unchanged.
+	MaxKeyDuration time.Duration `json:",omitempty"`
 }
 
 // ClientVersion is information about the latest client version that's available
@@ -2121,6 +2168,10 @@ const (
 	// fixed port.
 	NodeAttrRandomizeClientPort NodeCapability = "randomize-client-port"
 
+	// NodeAttrSilentDisco makes the client suppress disco heartbeats to its
+	// peers.
+	NodeAttrSilentDisco NodeCapability = "silent-disco"
+
 	// NodeAttrOneCGNATEnable makes the client prefer one big CGNAT /10 route
 	// rather than a /32 per peer. At most one of this or
 	// NodeAttrOneCGNATDisable may be set; if neither are, it's automatic.
@@ -2138,6 +2189,20 @@ const (
 	// NodeAttrDNSForwarderDisableTCPRetries disables retrying truncated
 	// DNS queries over TCP if the response is truncated.
 	NodeAttrDNSForwarderDisableTCPRetries NodeCapability = "dns-forwarder-disable-tcp-retries"
+
+	// NodeAttrLinuxMustUseIPTables forces Linux clients to use iptables for
+	// netfilter management.
+	// This cannot be set simultaneously with NodeAttrLinuxMustUseNfTables.
+	NodeAttrLinuxMustUseIPTables NodeCapability = "linux-netfilter?v=iptables"
+
+	// NodeAttrLinuxMustUseNfTables forces Linux clients to use nftables for
+	// netfilter management.
+	// This cannot be set simultaneously with NodeAttrLinuxMustUseIPTables.
+	NodeAttrLinuxMustUseNfTables NodeCapability = "linux-netfilter?v=nftables"
+
+	// NodeAttrSeamlessKeyRenewal makes clients enable beta functionality
+	// of renewing node keys without breaking connections.
+	NodeAttrSeamlessKeyRenewal NodeCapability = "seamless-key-renewal"
 )
 
 // SetDNSRequest is a request to add a DNS record.

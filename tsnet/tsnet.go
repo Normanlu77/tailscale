@@ -108,6 +108,10 @@ type Server struct {
 	// If empty, the Tailscale default is used.
 	ControlURL string
 
+	// RunWebClient, if true, runs a client for managing this node over
+	// its Tailscale interface on port 5252.
+	RunWebClient bool
+
 	// Port is the UDP port to listen on for WireGuard and peer-to-peer
 	// traffic. If zero, a port is automatically selected. Leave this
 	// field at zero unless you know what you are doing.
@@ -542,7 +546,13 @@ func (s *Server) start() (reterr error) {
 		return ok
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		return ns.DialContextTCP(ctx, dst)
+		// Note: don't just return ns.DialContextTCP or we'll
+		// return an interface containing a nil pointer.
+		tcpConn, err := ns.DialContextTCP(ctx, dst)
+		if err != nil {
+			return nil, err
+		}
+		return tcpConn, nil
 	}
 
 	if s.Store == nil {
@@ -575,6 +585,7 @@ func (s *Server) start() (reterr error) {
 	prefs.Hostname = s.hostname
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
+	prefs.RunWebClient = s.RunWebClient
 	authKey := s.getAuthKey()
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
@@ -603,6 +614,7 @@ func (s *Server) start() (reterr error) {
 	s.localAPIListener = lal
 	s.localClient = &tailscale.LocalClient{Dial: lal.Dial}
 	s.localAPIServer = &http.Server{Handler: lah}
+	s.lb.ConfigureWebClient(s.localClient)
 	go func() {
 		if err := s.localAPIServer.Serve(lal); err != nil {
 			logf("localapi serve error: %v", err)
@@ -1009,6 +1021,9 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	if srvConfig == nil {
 		srvConfig = &ipn.ServeConfig{}
 	}
+	if len(st.CertDomains) == 0 {
+		return nil, errors.New("Funnel not available; HTTPS must be enabled. See https://tailscale.com/s/https")
+	}
 	domain := st.CertDomains[0]
 	hp := ipn.HostPort(domain + ":" + portStr)
 	if !srvConfig.AllowFunnel[hp] {
@@ -1111,6 +1126,35 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	s.mu.Unlock()
 	return ln, nil
+}
+
+// CapturePcap can be called by the application code compiled with tsnet to save a pcap
+// of packets which the netstack within tsnet sees. This is expected to be useful during
+// debugging, probably not useful for production.
+//
+// Packets will be written to the pcap until the process exits. The pcap needs a Lua dissector
+// to be installed in WireShark in order to decode properly: wgengine/capture/ts-dissector.lua
+// in this repository.
+// https://tailscale.com/kb/1023/troubleshooting/#can-i-examine-network-traffic-inside-the-encrypted-tunnel
+func (s *Server) CapturePcap(ctx context.Context, pcapFile string) error {
+	stream, err := s.localClient.StreamDebugCapture(ctx)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(pcapFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		stream.Close()
+		return err
+	}
+
+	go func(stream io.ReadCloser, f *os.File) {
+		defer stream.Close()
+		defer f.Close()
+		_, _ = io.Copy(f, stream)
+	}(stream, f)
+
+	return nil
 }
 
 type listenKey struct {

@@ -34,6 +34,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/mak"
 	"tailscale.com/version"
 )
@@ -48,24 +49,24 @@ const (
 // current etag of a resource.
 var ErrETagMismatch = errors.New("etag mismatch")
 
-// serveHTTPContextKey is the context.Value key for a *serveHTTPContext.
-type serveHTTPContextKey struct{}
+var serveHTTPContextKey ctxkey.Key[*serveHTTPContext]
 
 type serveHTTPContext struct {
 	SrcAddr  netip.AddrPort
 	DestPort uint16
 }
 
-// serveListener is the state of host-level net.Listen for a specific (Tailscale IP, serve port)
+// localListener is the state of host-level net.Listen for a specific (Tailscale IP, port)
 // combination. If there are two TailscaleIPs (v4 and v6) and three ports being served,
 // then there will be six of these active and looping in their Run method.
 //
 // This is not used in userspace-networking mode.
 //
-// Most serve traffic is intercepted by netstack. This exists purely for connections
-// from the machine itself, as that goes via the kernel, so we need to be in the
-// kernel's listening/routing tables.
-type serveListener struct {
+// localListener is used by tailscale serve (TCP only) as well as the built-in web client.
+// Most serve traffic and peer traffic for the web client are intercepted by netstack.
+// This listener exists purely for connections from the machine itself, as that goes via the kernel,
+// so we need to be in the kernel's listening/routing tables.
+type localListener struct {
 	b      *LocalBackend
 	ap     netip.AddrPort
 	ctx    context.Context    // valid while listener is desired
@@ -73,24 +74,36 @@ type serveListener struct {
 	logf   logger.Logf
 	bo     *backoff.Backoff // for retrying failed Listen calls
 
+	handler       func(net.Conn) error            // handler for inbound connections
 	closeListener syncs.AtomicValue[func() error] // Listener's Close method, if any
 }
 
-func (b *LocalBackend) newServeListener(ctx context.Context, ap netip.AddrPort, logf logger.Logf) *serveListener {
+func (b *LocalBackend) newServeListener(ctx context.Context, ap netip.AddrPort, logf logger.Logf) *localListener {
 	ctx, cancel := context.WithCancel(ctx)
-	return &serveListener{
+	return &localListener{
 		b:      b,
 		ap:     ap,
 		ctx:    ctx,
 		cancel: cancel,
 		logf:   logf,
 
+		handler: func(conn net.Conn) error {
+			srcAddr := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
+			handler := b.tcpHandlerForServe(ap.Port(), srcAddr)
+			if handler == nil {
+				b.logf("[unexpected] local-serve: no handler for %v to port %v", srcAddr, ap.Port())
+				conn.Close()
+				return nil
+			}
+			return handler(conn)
+		},
 		bo: backoff.NewBackoff("serve-listener", logf, 30*time.Second),
 	}
+
 }
 
 // Close cancels the context and closes the listener, if any.
-func (s *serveListener) Close() error {
+func (s *localListener) Close() error {
 	s.cancel()
 	if close, ok := s.closeListener.LoadOk(); ok {
 		s.closeListener.Store(nil)
@@ -99,10 +112,10 @@ func (s *serveListener) Close() error {
 	return nil
 }
 
-// Run starts a net.Listen for the serveListener's address and port.
+// Run starts a net.Listen for the localListener's address and port.
 // If unable to listen, it retries with exponential backoff.
 // Listen is retried until the context is canceled.
-func (s *serveListener) Run() {
+func (s *localListener) Run() {
 	for {
 		ip := s.ap.Addr()
 		ipStr := ip.String()
@@ -115,7 +128,7 @@ func (s *serveListener) Run() {
 			// a specific interface. Without this hook, the system
 			// chooses a default interface to bind to.
 			if err := initListenConfig(&lc, ip, s.b.prevIfState, s.b.dialer.TUNName()); err != nil {
-				s.logf("serve failed to init listen config %v, backing off: %v", s.ap, err)
+				s.logf("localListener failed to init listen config %v, backing off: %v", s.ap, err)
 				s.bo.BackOff(s.ctx, err)
 				continue
 			}
@@ -138,26 +151,26 @@ func (s *serveListener) Run() {
 		ln, err := lc.Listen(s.ctx, tcp4or6, net.JoinHostPort(ipStr, fmt.Sprint(s.ap.Port())))
 		if err != nil {
 			if s.shouldWarnAboutListenError(err) {
-				s.logf("serve failed to listen on %v, backing off: %v", s.ap, err)
+				s.logf("localListener failed to listen on %v, backing off: %v", s.ap, err)
 			}
 			s.bo.BackOff(s.ctx, err)
 			continue
 		}
 		s.closeListener.Store(ln.Close)
 
-		s.logf("serve listening on %v", s.ap)
-		err = s.handleServeListenersAccept(ln)
+		s.logf("listening on %v", s.ap)
+		err = s.handleListenersAccept(ln)
 		if s.ctx.Err() != nil {
 			// context canceled, we're done
 			return
 		}
 		if err != nil {
-			s.logf("serve listener accept error, retrying: %v", err)
+			s.logf("localListener accept error, retrying: %v", err)
 		}
 	}
 }
 
-func (s *serveListener) shouldWarnAboutListenError(err error) bool {
+func (s *localListener) shouldWarnAboutListenError(err error) bool {
 	if !s.b.sys.NetMon.Get().InterfaceState().HasIP(s.ap.Addr()) {
 		// Machine likely doesn't have IPv6 enabled (or the IP is still being
 		// assigned). No need to warn. Notably, WSL2 (Issue 6303).
@@ -168,23 +181,17 @@ func (s *serveListener) shouldWarnAboutListenError(err error) bool {
 	return true
 }
 
-// handleServeListenersAccept accepts connections for the Listener. It calls the
+// handleListenersAccept accepts connections for the Listener. It calls the
 // handler in a new goroutine for each accepted connection. This is used to
-// handle local "tailscale serve" traffic originating from the machine itself.
-func (s *serveListener) handleServeListenersAccept(ln net.Listener) error {
+// handle local "tailscale serve" and web client traffic originating from the
+// machine itself.
+func (s *localListener) handleListenersAccept(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		srcAddr := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
-		handler := s.b.tcpHandlerForServe(s.ap.Port(), srcAddr)
-		if handler == nil {
-			s.b.logf("[unexpected] local-serve: no handler for %v to port %v", srcAddr, s.ap.Port())
-			conn.Close()
-			continue
-		}
-		go handler(conn)
+		go s.handler(conn)
 	}
 }
 
@@ -426,7 +433,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 		hs := &http.Server{
 			Handler: http.HandlerFunc(b.serveWebHandler),
 			BaseContext: func(_ net.Listener) context.Context {
-				return context.WithValue(context.Background(), serveHTTPContextKey{}, &serveHTTPContext{
+				return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
 					SrcAddr:  srcAddr,
 					DestPort: dport,
 				})
@@ -493,11 +500,6 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 	return nil
 }
 
-func getServeHTTPContext(r *http.Request) (c *serveHTTPContext, ok bool) {
-	c, ok = r.Context().Value(serveHTTPContextKey{}).(*serveHTTPContext)
-	return c, ok
-}
-
 func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, at string, ok bool) {
 	var z ipn.HTTPHandlerView // zero value
 
@@ -514,7 +516,7 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		hostname = r.TLS.ServerName
 	}
 
-	sctx, ok := getServeHTTPContext(r)
+	sctx, ok := serveHTTPContextKey.ValueOk(r.Context())
 	if !ok {
 		b.logf("[unexpected] localbackend: no serveHTTPContext in request")
 		return z, "", false
@@ -677,7 +679,7 @@ func addProxyForwardedHeaders(r *httputil.ProxyRequest) {
 	if r.In.TLS != nil {
 		r.Out.Header.Set("X-Forwarded-Proto", "https")
 	}
-	if c, ok := getServeHTTPContext(r.Out); ok {
+	if c, ok := serveHTTPContextKey.ValueOk(r.Out.Context()); ok {
 		r.Out.Header.Set("X-Forwarded-For", c.SrcAddr.Addr().String())
 	}
 }
@@ -689,7 +691,7 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	r.Out.Header.Del("Tailscale-User-Profile-Pic")
 	r.Out.Header.Del("Tailscale-Headers-Info")
 
-	c, ok := getServeHTTPContext(r.Out)
+	c, ok := serveHTTPContextKey.ValueOk(r.Out.Context())
 	if !ok {
 		return
 	}
@@ -750,7 +752,8 @@ func (b *LocalBackend) serveFileOrDirectory(w http.ResponseWriter, r *http.Reque
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		b.logf("error calling stat on %s: %v", fileOrDir, err)
+		http.Error(w, "an error occurred reading the file or directory", 500)
 		return
 	}
 	if fi.Mode().IsRegular() {
@@ -760,7 +763,8 @@ func (b *LocalBackend) serveFileOrDirectory(w http.ResponseWriter, r *http.Reque
 		}
 		f, err := os.Open(fileOrDir)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			b.logf("error opening %s: %v", fileOrDir, err)
+			http.Error(w, "an error occurred reading the file or directory", 500)
 			return
 		}
 		defer f.Close()

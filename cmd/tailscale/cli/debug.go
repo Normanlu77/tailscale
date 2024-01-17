@@ -130,6 +130,16 @@ var debugCmd = &ffcli.Command{
 			ShortHelp: "force a magicsock rebind",
 		},
 		{
+			Name:      "derp-set-homeless",
+			Exec:      localAPIAction("derp-set-homeless"),
+			ShortHelp: "enable DERP homeless mode (breaks reachablility)",
+		},
+		{
+			Name:      "derp-unset-homeless",
+			Exec:      localAPIAction("derp-unset-homeless"),
+			ShortHelp: "disable DERP homeless mode",
+		},
+		{
 			Name:      "break-tcp-conns",
 			Exec:      localAPIAction("break-tcp-conns"),
 			ShortHelp: "break any open TCP connections from the daemon",
@@ -179,6 +189,17 @@ var debugCmd = &ffcli.Command{
 				fs.BoolVar(&watchIPNArgs.netmap, "netmap", true, "include netmap in messages")
 				fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include initial status")
 				fs.BoolVar(&watchIPNArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
+				fs.IntVar(&watchIPNArgs.count, "count", 0, "exit after printing this many statuses, or 0 to keep going forever")
+				return fs
+			})(),
+		},
+		{
+			Name:      "netmap",
+			Exec:      runNetmap,
+			ShortHelp: "print the current network map",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("netmap")
+				fs.BoolVar(&netmapArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
 				return fs
 			})(),
 		},
@@ -237,7 +258,7 @@ var debugCmd = &ffcli.Command{
 		{
 			Name:      "portmap",
 			Exec:      debugPortmap,
-			ShortHelp: "run portmap debugging debugging",
+			ShortHelp: "run portmap debugging",
 			FlagSet: (func() *flag.FlagSet {
 				fs := newFlagSet("portmap")
 				fs.DurationVar(&debugPortmapArgs.duration, "duration", 5*time.Second, "timeout for port mapping")
@@ -252,6 +273,16 @@ var debugCmd = &ffcli.Command{
 			Name:      "peer-endpoint-changes",
 			Exec:      runPeerEndpointChanges,
 			ShortHelp: "prints debug information about a peer's endpoint changes",
+		},
+		{
+			Name:      "dial-types",
+			Exec:      runDebugDialTypes,
+			ShortHelp: "prints debug information about connecting to a given host or IP",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("dial-types")
+				fs.StringVar(&debugDialTypesArgs.network, "network", "tcp", `network type to dial ("tcp", "udp", etc.)`)
+				return fs
+			})(),
 		},
 	},
 }
@@ -406,6 +437,7 @@ var watchIPNArgs struct {
 	netmap         bool
 	initial        bool
 	showPrivateKey bool
+	count          int
 }
 
 func runWatchIPN(ctx context.Context, args []string) error {
@@ -421,8 +453,8 @@ func runWatchIPN(ctx context.Context, args []string) error {
 		return err
 	}
 	defer watcher.Close()
-	printf("Connected.\n")
-	for {
+	fmt.Fprintf(os.Stderr, "Connected.\n")
+	for seen := 0; watchIPNArgs.count == 0 || seen < watchIPNArgs.count; seen++ {
 		n, err := watcher.Next()
 		if err != nil {
 			return err
@@ -431,8 +463,36 @@ func runWatchIPN(ctx context.Context, args []string) error {
 			n.NetMap = nil
 		}
 		j, _ := json.MarshalIndent(n, "", "\t")
-		printf("%s\n", j)
+		fmt.Printf("%s\n", j)
 	}
+	return nil
+}
+
+var netmapArgs struct {
+	showPrivateKey bool
+}
+
+func runNetmap(ctx context.Context, args []string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
+	if !netmapArgs.showPrivateKey {
+		mask |= ipn.NotifyNoPrivateKeys
+	}
+	watcher, err := localClient.WatchIPNBus(ctx, mask)
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	n, err := watcher.Next()
+	if err != nil {
+		return err
+	}
+	j, _ := json.MarshalIndent(n.NetMap, "", "\t")
+	fmt.Printf("%s\n", j)
+	return nil
 }
 
 func runDERPMap(ctx context.Context, args []string) error {
@@ -633,8 +693,8 @@ func runVia(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid site-id %q; must be decimal or hex with 0x prefix", args[0])
 		}
-		if siteID > 0xff {
-			return fmt.Errorf("site-id values over 255 are currently reserved")
+		if siteID > 0xffff {
+			return fmt.Errorf("site-id values over 65535 are currently reserved")
 		}
 		ipp, err := netip.ParsePrefix(args[1])
 		if err != nil {
@@ -963,5 +1023,63 @@ func debugControlKnobs(ctx context.Context, args []string) error {
 	e := json.NewEncoder(os.Stdout)
 	e.SetIndent("", "  ")
 	e.Encode(v)
+	return nil
+}
+
+var debugDialTypesArgs struct {
+	network string
+}
+
+func runDebugDialTypes(ctx context.Context, args []string) error {
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return fixTailscaledConnectError(err)
+	}
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		printf("%s\n", description)
+		os.Exit(1)
+	}
+
+	if len(args) != 2 || args[0] == "" || args[1] == "" {
+		return errors.New("usage: dial-types <hostname-or-IP> <port>")
+	}
+
+	port, err := strconv.ParseUint(args[1], 10, 16)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: %w", args[1], err)
+	}
+
+	hostOrIP := args[0]
+	ip, _, err := tailscaleIPFromArg(ctx, hostOrIP)
+	if err != nil {
+		return err
+	}
+	if ip != hostOrIP {
+		log.Printf("lookup %q => %q", hostOrIP, ip)
+	}
+
+	qparams := make(url.Values)
+	qparams.Set("ip", ip)
+	qparams.Set("port", strconv.FormatUint(port, 10))
+	qparams.Set("network", debugDialTypesArgs.network)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://local-tailscaled.sock/localapi/v0/debug-dial-types?"+qparams.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := localClient.DoLocalRequest(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s", body)
 	return nil
 }
